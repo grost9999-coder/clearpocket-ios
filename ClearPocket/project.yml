@@ -5,7 +5,7 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    PRODUCT_BUNDLE_IDENTIFIER: com.example.clearpocket
+    PRODUCT_BUNDLE_IDENTIFIER: com.grost9999.clearpocket
     TARGETED_DEVICE_FAMILY: "1"
 targets:
   ClearPocket:
