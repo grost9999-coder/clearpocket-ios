@@ -283,23 +283,7 @@ func scanDocuments(_ root: URL) -> (groups: [[String]], message: String) {
 }
 
 struct MailScreen: View {
-    var body: some View {
-        List {
-            Section("Gmail · 待設定") {
-                Label("Google 登入與郵件權限", systemImage: "envelope")
-                Text("開發者需完成 OAuth 設定後，才能讀取你的郵件。此版本尚未連接，也不會刪除郵件。").font(.subheadline)
-            }
-            Section("Yahoo · 待設定") {
-                Label("Yahoo 郵件存取與 IMAP 連接", systemImage: "envelope.badge")
-                Text("需另外完成 Yahoo 郵件存取申請及 OAuth 整合；不能沿用 Gmail 授權。").font(.subheadline)
-            }
-            Section("預定清理規則") {
-                Text("同標題不代表重複；需比對寄件者、內文及附件。")
-                Text("促銷信和大附件分開列出，由你勾選；只移到垃圾桶。")
-                Text("信箱容量與 iPhone 可用空間分開顯示。")
-            }
-        }.navigationTitle("郵件整理")
-    }
+    var body: some View { GmailCleanupScreen() }
 }
 
 struct Dashboard: View {
@@ -316,7 +300,7 @@ struct Dashboard: View {
                 Section("清理工具") {
                     NavigationLink { PhotoScreen() } label: { Label("照片 · 掃描與批次刪除", systemImage: "photo.on.rectangle.angled") }
                     NavigationLink { DocumentScreen() } label: { Label("文件 · 重複內容掃描", systemImage: "doc.on.doc") }
-                    NavigationLink { MailScreen() } label: { Label("郵件 · Gmail / Yahoo 待設定", systemImage: "envelope") }
+                    NavigationLink { MailScreen() } label: { Label("郵件 · 垃圾郵件清理", systemImage: "envelope") }
                 }
                 Section {
                     Text("開發測試版 · 尚未完成真機驗證").font(.caption).foregroundStyle(.secondary)
