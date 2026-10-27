@@ -19,7 +19,19 @@ private struct GmailMessage: Decodable, Identifiable {
     var subject: String { header("Subject").isEmpty ? "（無標題）" : header("Subject") }
     var sender: String { header("From") }
     var date: Date { Date(timeIntervalSince1970: (Double(internalDate ?? "0") ?? 0) / 1000) }
-    func eligible(includeSpam: Bool, includePromotions: Bool) -> Bool {
+    var protectedFromCleanup: Bool {
+        !Set(labelIds ?? []).isDisjoint(with: ["TRASH", "STARRED", "IMPORTANT", "SENT", "DRAFT"])
+    }
+    var category: String {
+        let labels = Set(labelIds ?? [])
+        let names = [("TRASH", "垃圾桶"), ("DRAFT", "草稿"), ("SENT", "寄件備份"),
+                     ("SPAM", "垃圾郵件"), ("CATEGORY_PROMOTIONS", "促銷內容"),
+                     ("CATEGORY_SOCIAL", "社群網路"), ("CATEGORY_UPDATES", "最新快訊"),
+                     ("CATEGORY_FORUMS", "論壇"), ("INBOX", "收件匣")]
+        return names.first(where: { labels.contains($0.0) })?.1 ?? "已封存／其他郵件"
+    }
+    func eligible(scanAll: Bool, includeSpam: Bool, includePromotions: Bool) -> Bool {
+        if scanAll { return true }
         let labels = Set(labelIds ?? [])
         let matches = (includeSpam && labels.contains("SPAM")) || (includePromotions && labels.contains("CATEGORY_PROMOTIONS"))
         return matches && labels.isDisjoint(with: ["TRASH", "STARRED", "IMPORTANT", "SENT", "DRAFT"])
@@ -42,6 +54,9 @@ private final class GmailCleanupModel: ObservableObject {
     @Published var selected = Set<String>()
     @Published var busy = false
     @Published var status = "連線後才會讀取 Gmail，不會自動清理。"
+    @Published var scanAll = true
+    private var stopRequested = false
+    @Published var scanning = false
     @Published var includeSpam = true
     @Published var includePromotions = true
     @Published var onlyOld = false
@@ -75,7 +90,7 @@ private final class GmailCleanupModel: ObservableObject {
             }
             email = result.user.profile?.email ?? "已連線 Gmail"
             resetResults()
-            status = "已連線。請選擇條件，再按掃描廣告、促銷與垃圾信。"
+            status = "已連線。請選擇條件，再按開始掃描。"
         } catch { status = "連線未完成：\(error.localizedDescription)" }
     }
     func restore() async {
@@ -105,7 +120,7 @@ private final class GmailCleanupModel: ObservableObject {
         var sources: [String] = []
         if includeSpam { sources.append("in:spam") }
         if includePromotions { sources.append("category:promotions") }
-        var value = "{\(sources.joined(separator: " "))} -in:trash -is:starred -is:important -in:sent -in:drafts"
+        var value = scanAll ? "in:anywhere" : "{\(sources.joined(separator: " "))} -in:trash -is:starred -is:important -in:sent -in:drafts"
         if onlyOld { value += " older_than:30d" }
         if protectUnread { value += " -is:unread" }
         return value
@@ -141,42 +156,52 @@ private final class GmailCleanupModel: ObservableObject {
             URLQueryItem(name: "metadataHeaders", value: "From")
         ])
     }
+    func stopScan() { stopRequested = true }
     func scan(more: Bool = false) async {
         guard !busy, !email.isEmpty else { return }
-        guard includeSpam || includePromotions else {
-            status = "請至少選擇一個掃描範圍。"
-            return
+        guard scanAll || includeSpam || includePromotions else {
+            status = "請至少選擇一個掃描範圍。"; return
         }
-        busy = true
-        defer { busy = false }
+        if more && !hasMore { return }
+        busy = true; scanning = true; stopRequested = false
+        defer { busy = false; scanning = false }
         if !more { resetResults(); activeQuery = query() }
         guard let activeQuery else { return }
         do {
-            var items = [URLQueryItem(name: "q", value: activeQuery),
-                URLQueryItem(name: "includeSpamTrash", value: "true"),
-                URLQueryItem(name: "maxResults", value: "50")]
-            if more, let nextPage { items.append(URLQueryItem(name: "pageToken", value: nextPage)) }
-            let page: GmailPage = try await request("messages", items: items)
-            var loaded: [GmailMessage] = []
-            for (index, item) in (page.messages ?? []).enumerated() {
-                try Task.checkCancellation()
-                status = "讀取郵件 \(index + 1) / \(page.messages?.count ?? 0)…"
-                let message = try await metadata(item.id)
-                if message.eligible(includeSpam: includeSpam, includePromotions: includePromotions) && (!protectUnread || !(message.labelIds ?? []).contains("UNREAD")) {
-                    loaded.append(message)
+            var existing = Set(messages.map(\.id))
+            repeat {
+                if stopRequested { break }
+                var items = [URLQueryItem(name: "q", value: activeQuery),
+                    URLQueryItem(name: "includeSpamTrash", value: "true"),
+                    URLQueryItem(name: "maxResults", value: "50")]
+                if let nextPage { items.append(URLQueryItem(name: "pageToken", value: nextPage)) }
+                let page: GmailPage = try await request("messages", items: items)
+                // Finish this page before pausing so resuming never skips its remaining IDs.
+                for item in page.messages ?? [] {
+                    try Task.checkCancellation()
+                    guard !existing.contains(item.id) else { continue }
+                    let message = try await metadata(item.id)
+                    if message.eligible(scanAll: scanAll, includeSpam: includeSpam, includePromotions: includePromotions)
+                        && (!protectUnread || !(message.labelIds ?? []).contains("UNREAD")) {
+                        messages.append(message); existing.insert(message.id)
+                    }
+                    status = "掃描中，已載入 \(messages.count) 封郵件…"
+                    if stopRequested { status += "正在完成本頁後停止。" }
                 }
-            }
-            let existing = Set(messages.map(\.id))
-            messages += loaded.filter { !existing.contains($0.id) }
-            nextPage = page.nextPageToken
-            hasMore = nextPage != nil
-            status = messages.isEmpty && !hasMore
-                ? "掃描完成，沒有符合條件的郵件。可關閉日期或未讀篩選後重掃；星號、重要、寄件備份、草稿與垃圾桶一律排除。"
-                : "已載入 \(messages.count) 封符合條件的郵件。\(hasMore ? "還有更多，可繼續載入。" : "本次掃描完成。")"
-        } catch { status = "掃描未完成：\(error.localizedDescription)" }
+                nextPage = page.nextPageToken
+                hasMore = nextPage != nil
+            } while hasMore && !stopRequested
+            status = hasMore
+                ? "已暫停，載入 \(messages.count) 封。按繼續掃描可接續下一頁。"
+                : "掃描完成，共載入 \(messages.count) 封符合條件的郵件。"
+        } catch {
+            // Retry the current page on resume; existing message IDs are deduplicated.
+            hasMore = true
+            status = "掃描未完成，已保留 \(messages.count) 封：\(error.localizedDescription) 可按繼續掃描重試。"
+        }
     }
     func toggle(_ id: String) {
-        guard !busy else { return }
+        guard !busy, let message = messages.first(where: { $0.id == id }), !message.protectedFromCleanup else { return }
         if selected.contains(id) { selected.remove(id) } else { selected.insert(id) }
     }
     func moveSelectedToTrash() async {
@@ -191,7 +216,7 @@ private final class GmailCleanupModel: ObservableObject {
                 status = "處理 \(index + 1) / \(targets.count)…"
                 // 再讀最新標籤，確認仍在選定範圍且未加上保護標籤。
                 let current = try await metadata(id)
-                guard current.eligible(includeSpam: includeSpam, includePromotions: includePromotions) && (!protectUnread || !(current.labelIds ?? []).contains("UNREAD")) else {
+                guard !current.protectedFromCleanup && current.eligible(scanAll: scanAll, includeSpam: includeSpam, includePromotions: includePromotions) && (!protectUnread || !(current.labelIds ?? []).contains("UNREAD")) else {
                     selected.remove(id); messages.removeAll { $0.id == id }; skipped += 1; continue
                 }
                 let _: GmailMessage = try await request("messages/\(id)/trash", method: "POST")
@@ -209,6 +234,9 @@ private final class GmailCleanupModel: ObservableObject {
 struct GmailCleanupScreen: View {
     @StateObject private var model = GmailCleanupModel()
     @State private var confirm = false
+    private var selectableIDs: Set<String> {
+        Set(model.messages.filter { !$0.protectedFromCleanup }.map(\.id))
+    }
     var body: some View {
         List {
             Section("Gmail") {
@@ -229,24 +257,31 @@ struct GmailCleanupScreen: View {
                 }
             }
             Section("掃描範圍") {
-                Toggle("垃圾郵件", isOn: $model.includeSpam)
-                Toggle("廣告／促銷信", isOn: $model.includePromotions)
+                Toggle("全部郵件", isOn: $model.scanAll)
+                Toggle("垃圾郵件", isOn: $model.includeSpam).disabled(model.scanAll)
+                Toggle("廣告／促銷信", isOn: $model.includePromotions).disabled(model.scanAll)
                 Toggle("只列出超過 30 天的信", isOn: $model.onlyOld)
                 Toggle("保留未讀郵件", isOn: $model.protectUnread)
-                Text("廣告／促銷信依 Gmail 的「促銷內容」分類列出，包含收件匣及已封存的促銷信；未被分類的廣告不一定會列出。星號、重要、寄件備份、草稿與垃圾桶一律排除。")
+                Text("全部郵件包含主要、社群、促銷、快訊、已封存、寄件備份、草稿、垃圾郵件與垃圾桶。星號、重要、寄件備份、草稿與垃圾桶內郵件可檢視，但不供勾選清理。日期與未讀條件仍會套用。")
                     .font(.footnote).foregroundStyle(.secondary)
                 Button { Task { await model.scan() } } label: {
-                    Label("掃描廣告、促銷與垃圾信", systemImage: "magnifyingglass")
-                }.disabled(model.email.isEmpty || model.busy || (!model.includeSpam && !model.includePromotions))
+                    Label(model.scanAll ? "開始掃描全部郵件" : "掃描廣告、促銷與垃圾信", systemImage: "magnifyingglass")
+                }.disabled(model.email.isEmpty || model.busy || (!model.scanAll && !model.includeSpam && !model.includePromotions))
             }.disabled(model.busy)
             Section {
                 if model.busy { ProgressView() }
+                if model.scanning {
+                    Button("停止掃描（完成本頁後停止）") { model.stopScan() }
+                }
+                if model.hasMore && !model.busy {
+                    Button("繼續掃描") { Task { await model.scan(more: true) } }
+                }
                 Text(model.status).font(.subheadline)
             }
             if !model.messages.isEmpty {
                 Section("已載入 \(model.messages.count) 封 · 已選 \(model.selected.count) 封") {
-                    Button(model.selected.count == model.messages.count ? "取消全選" : "全選已載入郵件") {
-                        model.selected = model.selected.count == model.messages.count ? [] : Set(model.messages.map(\.id))
+                    Button(model.selected == selectableIDs ? "取消全選" : "全選已載入郵件") {
+                        model.selected = model.selected == selectableIDs ? [] : selectableIDs
                     }.disabled(model.busy)
                     ForEach(model.messages) { message in
                         Button { model.toggle(message.id) } label: {
@@ -257,18 +292,18 @@ struct GmailCleanupScreen: View {
                                     Text(message.subject).font(.headline).foregroundStyle(.primary)
                                     Text(message.sender).font(.caption).foregroundStyle(.secondary)
                                     Text(message.date, style: .date).font(.caption).foregroundStyle(.secondary)
-                                    Text((message.labelIds ?? []).contains("SPAM") ? "垃圾郵件" : "廣告／促銷信")
+                                    Text(message.category)
                                         .font(.caption).foregroundStyle(.blue)
+                                    if message.protectedFromCleanup {
+                                        Label("受保護，僅供檢視", systemImage: "lock").font(.caption).foregroundStyle(.secondary)
+                                    }
                                     if (message.labelIds ?? []).contains("UNREAD") {
                                         Text("未讀").font(.caption).foregroundStyle(.secondary)
                                     }
                                 }
                             }
-                        }.disabled(model.busy)
+                        }.disabled(model.busy || message.protectedFromCleanup)
                         .accessibilityLabel("\(message.subject)，\(model.selected.contains(message.id) ? "已選取" : "未選取")")
-                    }
-                    if model.hasMore {
-                        Button("載入接下來 50 封") { Task { await model.scan(more: true) } }.disabled(model.busy)
                     }
                     Button(role: .destructive) { confirm = true } label: {
                         Label("將所選 \(model.selected.count) 封移到垃圾桶", systemImage: "trash")
@@ -283,8 +318,9 @@ struct GmailCleanupScreen: View {
                 Text("Yahoo 連線尚未完成，目前不會讀取或清理 Yahoo 郵件。")
             }
         }
-        .navigationTitle("郵件與垃圾信清理")
+        .navigationTitle("全部郵件整理")
         .task { await model.restore() }
+        .onChange(of: model.scanAll) { _, _ in model.resetResults() }
         .onChange(of: model.includeSpam) { _, _ in model.resetResults() }
         .onChange(of: model.includePromotions) { _, _ in model.resetResults() }
         .onChange(of: model.onlyOld) { _, _ in model.resetResults() }
@@ -294,7 +330,8 @@ struct GmailCleanupScreen: View {
             Button("取消", role: .cancel) { }
             Button("移到垃圾桶", role: .destructive) { Task { await model.moveSelectedToTrash() } }
         } message: {
-            Text("只處理目前勾選的郵件。清理前會再檢查是否仍在所選掃描範圍，並保護星號、重要、寄件備份與草稿。")
+            Text("只處理目前勾選的郵件。清理前會再檢查是否仍在所選掃描範圍，並保護星號、重要、寄件備份、草稿與垃圾桶內郵件。")
         }
     }
 }
+
