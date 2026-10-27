@@ -19,6 +19,7 @@ targets:
   ClearPocket:
     type: application
     platform: iOS
+
     sources:
       - Sources
 
@@ -34,11 +35,16 @@ targets:
         CFBundleDisplayName: 清爽口袋
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+
         UILaunchScreen: {}
+
         NSPhotoLibraryUsageDescription: 掃描完全重複的照片，並在你確認後刪除多餘副本。
+
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
+
         GIDClientID: $(GOOGLE_CLIENT_ID)
+
         CFBundleURLTypes:
           - CFBundleURLSchemes:
               - $(GOOGLE_REVERSED_CLIENT_ID)
@@ -50,5 +56,7 @@ targets:
         TARGETED_DEVICE_FAMILY: "1"
         MARKETING_VERSION: "1.0"
         CURRENT_PROJECT_VERSION: "2"
+
         GOOGLE_CLIENT_ID: 1096683541548-i3aevnhedftnla9h4bu052vclkbu7bfk.apps.googleusercontent.com
+
         GOOGLE_REVERSED_CLIENT_ID: com.googleusercontent.apps.1096683541548-i3aevnhedftnla9h4bu052vclkbu7bfk
