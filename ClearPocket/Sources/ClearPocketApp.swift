@@ -268,7 +268,7 @@ struct DocumentScreen: View {
     }
     var body: some View {
         List {
-            Section("掃描位置") {
+            Section {
                 Button("加入資料夾與子資料夾") { pickFolders = true; picker = true }.disabled(busy)
                 Button("加入個別文件") { pickFolders = false; picker = true }.disabled(busy)
                 ForEach(roots, id: \.absoluteString) { root in
@@ -280,6 +280,8 @@ struct DocumentScreen: View {
                         roots = []; files = []; message = "請重新加入掃描位置。"
                     }.disabled(busy)
                 }
+            } header: {
+                Text("掃描位置")
             } footer: {
                 Text("可分次加入多個位置。iOS 僅允許讀取你選取的資料夾與文件，無法掃描其他 App 的私人檔案或整部手機的系統目錄。")
             }
