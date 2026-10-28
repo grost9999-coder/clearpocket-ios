@@ -64,6 +64,16 @@ final class HashState: @unchecked Sendable {
     }
 }
 
+private struct PhotoScanEntry: Codable {
+    let digest: String
+    let modified: Date?
+}
+private struct PhotoScanCheckpoint: Codable {
+    var entries: [String: PhotoScanEntry] = [:]
+    var pending = true
+    var includeCloud = true
+}
+
 @MainActor
 final class PhotoModel: ObservableObject {
     @Published var groups: [PhotoGroup] = []
@@ -72,10 +82,22 @@ final class PhotoModel: ObservableObject {
     @Published var message = "掃描所有已授權照片，含 Live Photo、RAW 與編輯照片；完整內容在手機內比對。"
     @Published var includeCloud = true
     @Published var scanning = false
+    @Published var canResume = false
     private var stopRequested = false
+    init() {
+        if let saved = ScanCheckpoint.load("photos", as: PhotoScanCheckpoint.self), saved.pending {
+            canResume = true; includeCloud = saved.includeCloud
+            message = "有未完成的照片掃描，可按繼續上次掃描。"
+        }
+    }
     func stopScan() { stopRequested = true }
-    func scan() async {
+    func scan(resume: Bool = false) async {
         guard !busy else { return }
+        let lease = BackgroundScanLease(name: "Photo scan")
+        defer { lease.end() }
+        var saved = resume ? (ScanCheckpoint.load("photos", as: PhotoScanCheckpoint.self) ?? PhotoScanCheckpoint()) : PhotoScanCheckpoint()
+        saved.includeCloud = includeCloud; saved.pending = true
+        ScanCheckpoint.save(saved, name: "photos")
         busy = true; scanning = true; stopRequested = false
         selected = []
         groups = []
@@ -91,20 +113,31 @@ final class PhotoModel: ObservableObject {
         var skipped = 0
         var scanned = 0
         for index in 0..<result.count {
-            if stopRequested { break }
+            if stopRequested || lease.cancellation.isCancelled { break }
             let asset = result.object(at: index)
             message = "掃描 \(index + 1) / \(result.count)"
             do {
-                let hash = try await PhotoScanner.digest(asset, allowNetwork: includeCloud)
+                let hash: String
+                if let old = saved.entries[asset.localIdentifier], let modified = asset.modificationDate,
+                   old.modified == modified {
+                    hash = old.digest
+                } else {
+                    hash = try await PhotoScanner.digest(asset, allowNetwork: includeCloud)
+                    saved.entries[asset.localIdentifier] = PhotoScanEntry(digest: hash, modified: asset.modificationDate)
+                }
                 buckets[hash, default: []].append(asset)
             } catch { skipped += 1 }
             scanned += 1
+            if scanned % 10 == 0 { ScanCheckpoint.save(saved, name: "photos") }
         }
         groups = buckets.keys.sorted().compactMap { key in
             guard let assets = buckets[key], assets.count > 1 else { return nil }
             return PhotoGroup(assets: assets)
         }
-        message = "\(stopRequested ? "已停止" : "掃描完成")：已處理 \(scanned) / \(result.count) 張，找到 \(groups.count) 組完全重複照片。略過 \(skipped) 張（無法讀取完整資源或未允許下載雲端原檔）。"
+        saved.pending = scanned < result.count
+        canResume = saved.pending
+        ScanCheckpoint.save(saved, name: "photos")
+        message = "\(saved.pending ? "已暫停，可繼續" : "掃描完成")：已處理 \(scanned) / \(result.count) 張，找到 \(groups.count) 組完全重複照片。略過 \(skipped) 張（無法讀取完整資源或未允許下載雲端原檔）。"
         if status == .limited { message += " 目前只掃描已授權照片。" }
     }
     func suggest() {
@@ -149,6 +182,7 @@ final class PhotoModel: ObservableObject {
                 PHAssetChangeRequest.deleteAssets(deletion as NSArray)
             }
             selected = []
+            ScanCheckpoint.clear("photos"); canResume = false
             groups = groups.compactMap { group in
                 let remaining = group.assets.filter { !deletionIDs.contains($0.localIdentifier) }
                 return remaining.count > 1 ? PhotoGroup(assets: remaining) : nil
@@ -196,6 +230,10 @@ struct PhotoScreen: View {
                 Button(model.busy ? "處理中…" : "掃描全部已授權照片") {
                     Task { await model.scan() }
                 }.disabled(model.busy)
+                if model.canResume && !model.busy {
+                    Button("繼續上次掃描") { Task { await model.scan(resume: true) } }
+                }
+                Text("切換 App 後可短暫繼續，系統暫停後會保留進度。回來可接續；強制關閉 App 不會繼續掃描。").font(.footnote).foregroundStyle(.secondary)
                 if model.busy { ProgressView() }
                 if model.scanning {
                     Button("停止掃描（完成目前照片後停止）") { model.stopScan() }
@@ -242,17 +280,24 @@ struct PhotoScreen: View {
     }
 }
 
-struct ScannedDocument: Identifiable, Sendable {
+struct ScannedDocument: Identifiable, Codable, Sendable {
     var id: String { path }
     let path: String
     let name: String
     let bytes: Int64
     let digest: String
+    let modified: Date?
 }
 struct DocumentScanResult: Sendable {
     let files: [ScannedDocument]
     let skipped: Int
     let inaccessibleRoots: Int
+    let paused: Bool
+}
+private struct DocumentScanCheckpoint: Codable {
+    let roots: [String]
+    let files: [ScannedDocument]
+    let pending: Bool
 }
 struct DocumentScreen: View {
     @State private var picker = false
@@ -261,6 +306,9 @@ struct DocumentScreen: View {
     @State private var roots: [URL] = []
     @State private var files: [ScannedDocument] = []
     @State private var duplicatesOnly = false
+    @State private var restored = false
+    @State private var cancellation: ScanCancellation?
+    @State private var canResume = false
     @State private var message = "加入「我的 iPhone」或 iCloud Drive 中可選取的資料夾，會連同所有子資料夾一起掃描。"
     private var groups: [[ScannedDocument]] {
         Dictionary(grouping: files, by: \.digest).values.filter { $0.count > 1 }
@@ -276,8 +324,13 @@ struct DocumentScreen: View {
                 }
                 if !roots.isEmpty {
                     Button("掃描全部已選位置") { scan() }.disabled(busy)
+                    if canResume {
+                        Button("繼續上次文件掃描") { scan(resume: true) }.disabled(busy)
+                    }
                     Button("清除掃描位置與結果", role: .destructive) {
-                        roots = []; files = []; message = "請重新加入掃描位置。"
+                        roots = []; files = []; canResume = false
+                        ScanCheckpoint.clear("documents"); ScanCheckpoint.clear("document-roots")
+                        message = "請重新加入掃描位置。"
                     }.disabled(busy)
                 }
             } header: {
@@ -286,11 +339,14 @@ struct DocumentScreen: View {
                 Text("可分次加入多個位置。iOS 僅允許讀取你選取的資料夾與文件，無法掃描其他 App 的私人檔案或整部手機的系統目錄。")
             }
             Section {
-                if busy { ProgressView("正在讀取與比對所有已選位置…") }
+                if busy {
+                    ProgressView("正在讀取與比對所有已選位置…")
+                    Button("停止文件掃描") { cancellation?.cancel() }
+                }
                 Text(message).font(.subheadline)
                 Toggle("只顯示完全重複的文件", isOn: $duplicatesOnly)
             } footer: {
-                Text("只讀取已下載的檔案；雲端未下載、無權限或讀取失敗項目會略過。文件內容在手機內比對；文件刪除尚未啟用。")
+                Text("只讀取已下載的檔案；雲端未下載、無權限或讀取失敗項目會略過。文件內容在手機內比對；文件刪除尚未啟用。切換 App 後可短暫繼續，系統暫停後可接續。")
             }
             if duplicatesOnly {
                 ForEach(Array(groups.enumerated()), id: \.offset) { index, group in
@@ -305,6 +361,20 @@ struct DocumentScreen: View {
             }
         }
         .navigationTitle("文件全面掃描")
+        .onAppear {
+            guard !restored else { return }; restored = true
+            if let bookmarks = ScanCheckpoint.load("document-roots", as: [Data].self) {
+                roots = bookmarks.compactMap { data in
+                    var stale = false
+                    return try? URL(resolvingBookmarkData: data, options: [.withoutUI], relativeTo: nil, bookmarkDataIsStale: &stale)
+                }
+            }
+            if let saved = ScanCheckpoint.load("documents", as: DocumentScanCheckpoint.self),
+               saved.roots == roots.map(\.absoluteString) {
+                files = saved.files; canResume = saved.pending
+                message = "已恢復 \(files.count) 份文件的掃描進度。\(canResume ? "可按繼續上次文件掃描。" : "上次掃描已完成。")"
+            }
+        }
         .fileImporter(isPresented: $picker,
                       allowedContentTypes: pickFolders ? [.folder] : [.data],
                       allowsMultipleSelection: true) { result in
@@ -312,7 +382,13 @@ struct DocumentScreen: View {
             case .failure(let error): message = "未加入位置：\(error.localizedDescription)"
             case .success(let urls):
                 for url in urls where !roots.contains(url) { roots.append(url) }
-                files = []
+                files = []; canResume = false; ScanCheckpoint.clear("documents")
+                let bookmarks = roots.compactMap { url -> Data? in
+                    guard url.startAccessingSecurityScopedResource() else { return nil }
+                    defer { url.stopAccessingSecurityScopedResource() }
+                    return try? url.bookmarkData(options: [.minimalBookmark], includingResourceValuesForKeys: nil, relativeTo: nil)
+                }
+                ScanCheckpoint.save(bookmarks, name: "document-roots")
                 message = "已加入 \(roots.count) 個位置。請按「掃描全部已選位置」。"
             }
         }
@@ -325,27 +401,46 @@ struct DocumentScreen: View {
                 .font(.caption).foregroundStyle(.secondary)
         }
     }
-    private func scan() {
+    private func scan(resume: Bool = false) {
         guard !busy else { return }
+        let lease = BackgroundScanLease(name: "Document scan")
+        cancellation = lease.cancellation
         busy = true; files = []; message = "正在掃描全部已選位置…"
         let selectedRoots = roots
         Task {
-            let result = await Task.detached(priority: .utility) { scanDocuments(selectedRoots) }.value
+            defer { lease.end(); cancellation = nil }
+            let token = lease.cancellation
+            let result = await Task.detached(priority: .utility) {
+                scanDocuments(selectedRoots, resume: resume, cancellation: token)
+            }.value
             files = result.files
-            message = "已掃描 \(files.count) 份文件，找到 \(groups.count) 組完全重複文件。略過 \(result.skipped) 項，\(result.inaccessibleRoots) 個位置無法存取。"
+            canResume = result.paused
+            message = "\(canResume ? "已暫停，可繼續。" : "掃描完成。")已掃描 \(files.count) 份文件，找到 \(groups.count) 組完全重複文件。略過 \(result.skipped) 項，\(result.inaccessibleRoots) 個位置無法存取。"
             busy = false
         }
     }
 }
 
-func scanDocuments(_ roots: [URL]) -> DocumentScanResult {
+func scanDocuments(_ roots: [URL], resume: Bool = false,
+                   cancellation: ScanCancellation = ScanCancellation()) -> DocumentScanResult {
+    let rootIDs = roots.map(\.absoluteString)
+    let old = resume ? ScanCheckpoint.load("documents", as: DocumentScanCheckpoint.self) : nil
+    let cache = Dictionary(uniqueKeysWithValues: (old?.roots == rootIDs ? old?.files ?? [] : []).map { ($0.path, $0) })
     var files: [ScannedDocument] = []
+    func save(pending: Bool) {
+        var progress = pending ? cache : [:]
+        for file in files { progress[file.path] = file }
+        ScanCheckpoint.save(DocumentScanCheckpoint(roots: rootIDs,
+            files: Array(progress.values), pending: pending), name: "documents")
+    }
+    save(pending: true)
     var visited = Set<String>()
     var skipped = 0
     var inaccessibleRoots = 0
     let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey,
-        .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey, .fileSizeKey]
+        .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey, .fileSizeKey, .contentModificationDateKey]
     func readFile(_ url: URL) {
+        guard !cancellation.isCancelled else { return }
         let path = url.standardizedFileURL.path
         guard !visited.contains(path) else { return }
         visited.insert(path)
@@ -355,19 +450,26 @@ func scanDocuments(_ roots: [URL]) -> DocumentScanResult {
             if values.isUbiquitousItem == true && values.ubiquitousItemDownloadingStatus != .current {
                 skipped += 1; return
             }
+            if let previous = cache[path], let modified = values.contentModificationDate,
+               previous.modified == modified, previous.bytes == Int64(values.fileSize ?? -1) {
+                files.append(previous); return
+            }
             // Stream the file rather than allocating its full size in memory.
             let handle = try FileHandle(forReadingFrom: url)
             defer { try? handle.close() }
             var hash = SHA256()
             var bytes: Int64 = 0
             while let chunk = try handle.read(upToCount: 1024 * 1024), !chunk.isEmpty {
+                if cancellation.isCancelled { return }
                 hash.update(data: chunk); bytes += Int64(chunk.count)
             }
             let digest = hash.finalize().map { String(format: "%02x", $0) }.joined()
-            files.append(ScannedDocument(path: path, name: url.lastPathComponent, bytes: bytes, digest: digest))
+            files.append(ScannedDocument(path: path, name: url.lastPathComponent, bytes: bytes, digest: digest, modified: values.contentModificationDate))
+            if files.count % 10 == 0 { save(pending: true) }
         } catch { skipped += 1 }
     }
     for root in roots {
+        if cancellation.isCancelled { break }
         guard root.startAccessingSecurityScopedResource() else { inaccessibleRoots += 1; continue }
         defer { root.stopAccessingSecurityScopedResource() }
         do {
@@ -380,12 +482,16 @@ func scanDocuments(_ roots: [URL]) -> DocumentScanResult {
                     errorHandler: { _, _ in skipped += 1; return true }) else {
                     inaccessibleRoots += 1; continue
                 }
-                for case let url as URL in entries { readFile(url) }
+                for case let url as URL in entries {
+                    if cancellation.isCancelled { break }
+                    readFile(url)
+                }
             } else { readFile(root) }
         } catch { inaccessibleRoots += 1 }
     }
+    save(pending: cancellation.isCancelled)
     return DocumentScanResult(files: files.sorted { $0.path < $1.path },
-                              skipped: skipped, inaccessibleRoots: inaccessibleRoots)
+                              skipped: skipped, inaccessibleRoots: inaccessibleRoots, paused: cancellation.isCancelled)
 }
 
 struct MailScreen: View {
