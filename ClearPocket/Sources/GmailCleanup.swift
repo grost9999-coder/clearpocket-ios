@@ -3,12 +3,12 @@ import UIKit
 import GoogleSignIn
 import GoogleSignInSwift
 
-private struct GmailHeader: Codable {
+struct GmailHeader: Codable {
     let name: String
     let value: String
 }
-private struct GmailPayload: Codable { let headers: [GmailHeader]? }
-private struct GmailMessage: Codable, Identifiable {
+struct GmailPayload: Codable { let headers: [GmailHeader]? }
+struct GmailMessage: Codable, Identifiable {
     let id: String
     let labelIds: [String]?
     let internalDate: String?
@@ -37,17 +37,17 @@ private struct GmailMessage: Codable, Identifiable {
         return matches && labels.isDisjoint(with: ["TRASH", "STARRED", "IMPORTANT", "SENT", "DRAFT"])
     }
 }
-private struct GmailPage: Decodable {
+struct GmailPage: Decodable {
     struct Item: Decodable { let id: String }
     let messages: [Item]?
     let nextPageToken: String?
 }
-private struct GmailProblem: LocalizedError {
+struct GmailProblem: LocalizedError {
     let errorDescription: String?
     init(_ text: String) { errorDescription = text }
 }
 
-private struct GmailScanCheckpoint: Codable {
+struct GmailScanCheckpoint: Codable {
     let email: String
     let query: String
     let messages: [GmailMessage]
@@ -61,7 +61,7 @@ private struct GmailScanCheckpoint: Codable {
 }
 
 @MainActor
-private final class GmailCleanupModel: ObservableObject {
+final class GmailCleanupModel: ObservableObject {
     @Published var email = ""
     @Published var messages: [GmailMessage] = []
     @Published var selected = Set<String>()
@@ -237,7 +237,9 @@ private final class GmailCleanupModel: ObservableObject {
             // Retry the current page on resume; existing message IDs are deduplicated.
             hasMore = true
             saveProgress(pending: true)
-            status = "掃描未完成，已保留 \(messages.count) 封：\(error.localizedDescription) 可按繼續掃描重試。"
+            status = lease.cancellation.isCancelled
+                ? "系統背景時間已到，已保存 \(messages.count) 封郵件的進度。回到前景後可繼續掃描。"
+                : "掃描未完成，已保留 \(messages.count) 封：\(error.localizedDescription) 可按繼續掃描重試。"
         }
     }
     func toggle(_ id: String) {
@@ -274,7 +276,7 @@ private final class GmailCleanupModel: ObservableObject {
 }
 
 struct GmailCleanupScreen: View {
-    @StateObject private var model = GmailCleanupModel()
+    @ObservedObject var model: GmailCleanupModel
     @State private var confirm = false
     private var selectableIDs: Set<String> {
         Set(model.messages.filter { !$0.protectedFromCleanup }.map(\.id))

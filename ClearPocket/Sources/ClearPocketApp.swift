@@ -83,21 +83,26 @@ final class PhotoModel: ObservableObject {
     @Published var includeCloud = true
     @Published var scanning = false
     @Published var canResume = false
+    let mediaType: PHAssetMediaType
+    var kind: String { mediaType == .video ? "影片" : "照片" }
+    private var checkpointName: String { mediaType == .video ? "videos" : "photos" }
     private var stopRequested = false
-    init() {
-        if let saved = ScanCheckpoint.load("photos", as: PhotoScanCheckpoint.self), saved.pending {
+    init(mediaType: PHAssetMediaType = .image) {
+        self.mediaType = mediaType
+        if mediaType == .video { message = "掃描所有已授權影片，完整內容相同才列為重複。" }
+        if let saved = ScanCheckpoint.load(checkpointName, as: PhotoScanCheckpoint.self), saved.pending {
             canResume = true; includeCloud = saved.includeCloud
-            message = "有未完成的照片掃描，可按繼續上次掃描。"
+            message = "有未完成的\(kind)掃描，可按繼續上次掃描。"
         }
     }
     func stopScan() { stopRequested = true }
     func scan(resume: Bool = false) async {
         guard !busy else { return }
-        let lease = BackgroundScanLease(name: "Photo scan")
+        let lease = BackgroundScanLease(name: "\(kind) scan")
         defer { lease.end() }
-        var saved = resume ? (ScanCheckpoint.load("photos", as: PhotoScanCheckpoint.self) ?? PhotoScanCheckpoint()) : PhotoScanCheckpoint()
+        var saved = resume ? (ScanCheckpoint.load(checkpointName, as: PhotoScanCheckpoint.self) ?? PhotoScanCheckpoint()) : PhotoScanCheckpoint()
         saved.includeCloud = includeCloud; saved.pending = true
-        ScanCheckpoint.save(saved, name: "photos")
+        ScanCheckpoint.save(saved, name: checkpointName)
         busy = true; scanning = true; stopRequested = false
         selected = []
         groups = []
@@ -108,7 +113,7 @@ final class PhotoModel: ObservableObject {
         }
         let options = PHFetchOptions()
         options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]
-        let result = PHAsset.fetchAssets(with: .image, options: options)
+        let result = PHAsset.fetchAssets(with: mediaType, options: options)
         var buckets: [String: [PHAsset]] = [:]
         var skipped = 0
         var scanned = 0
@@ -128,7 +133,7 @@ final class PhotoModel: ObservableObject {
                 buckets[hash, default: []].append(asset)
             } catch { skipped += 1 }
             scanned += 1
-            if scanned % 10 == 0 { ScanCheckpoint.save(saved, name: "photos") }
+            if scanned % 10 == 0 { ScanCheckpoint.save(saved, name: checkpointName) }
         }
         groups = buckets.keys.sorted().compactMap { key in
             guard let assets = buckets[key], assets.count > 1 else { return nil }
@@ -136,9 +141,9 @@ final class PhotoModel: ObservableObject {
         }
         saved.pending = scanned < result.count
         canResume = saved.pending
-        ScanCheckpoint.save(saved, name: "photos")
-        message = "\(saved.pending ? "已暫停，可繼續" : "掃描完成")：已處理 \(scanned) / \(result.count) 張，找到 \(groups.count) 組完全重複照片。略過 \(skipped) 張（無法讀取完整資源或未允許下載雲端原檔）。"
-        if status == .limited { message += " 目前只掃描已授權照片。" }
+        ScanCheckpoint.save(saved, name: checkpointName)
+        message = "\(saved.pending ? "已暫停，可繼續" : "掃描完成")：已處理 \(scanned) / \(result.count) 個項目，找到 \(groups.count) 組完全重複\(kind)。略過 \(skipped) 個項目（無法讀取完整資源或未允許下載雲端原檔）。"
+        if status == .limited { message += " 目前只掃描已授權項目。" }
     }
     func suggest() {
         selected = Set(groups.flatMap { group in
@@ -182,12 +187,12 @@ final class PhotoModel: ObservableObject {
                 PHAssetChangeRequest.deleteAssets(deletion as NSArray)
             }
             selected = []
-            ScanCheckpoint.clear("photos"); canResume = false
+            ScanCheckpoint.clear(checkpointName); canResume = false
             groups = groups.compactMap { group in
                 let remaining = group.assets.filter { !deletionIDs.contains($0.localIdentifier) }
                 return remaining.count > 1 ? PhotoGroup(assets: remaining) : nil
             }
-            message = "已刪除 \(deletion.count) 張。可到「照片 → 最近刪除」查看。"
+            message = "已刪除 \(deletion.count) 個項目。可到「照片 → 最近刪除」查看。"
         } catch { message = "未完成清理：\(error.localizedDescription) 請重新掃描。" }
     }
 }
@@ -215,7 +220,7 @@ struct Thumbnail: View {
 }
 
 struct PhotoScreen: View {
-    @StateObject private var model = PhotoModel()
+    @ObservedObject var model: PhotoModel
     @State private var confirm = false
     @Environment(\.openURL) private var openURL
     var body: some View {
@@ -227,7 +232,7 @@ struct PhotoScreen: View {
                     if let url = URL(string: UIApplication.openSettingsURLString) { openURL(url) }
                 }.disabled(model.busy)
                 Text(model.message).font(.subheadline).foregroundStyle(.secondary)
-                Button(model.busy ? "處理中…" : "掃描全部已授權照片") {
+                Button(model.busy ? "處理中…" : "掃描全部已授權\(model.kind)") {
                     Task { await model.scan() }
                 }.disabled(model.busy)
                 if model.canResume && !model.busy {
@@ -236,16 +241,16 @@ struct PhotoScreen: View {
                 Text("切換 App 後可短暫繼續，系統暫停後會保留進度。回來可接續；強制關閉 App 不會繼續掃描。").font(.footnote).foregroundStyle(.secondary)
                 if model.busy { ProgressView() }
                 if model.scanning {
-                    Button("停止掃描（完成目前照片後停止）") { model.stopScan() }
+                    Button("停止掃描（完成目前項目後停止）") { model.stopScan() }
                 }
             } footer: {
-                Text("要掃描整個照片圖庫，請在設定中允許「完整取用」。Live Photo、RAW 與編輯照片會比對每一份資源，全部相同才列為重複；不會將只有外觀相似的照片列入。")
+                Text("要掃描整個照片與影片圖庫，請在設定中允許「完整取用」。Live Photo、RAW 與編輯照片會比對每一份資源，全部相同才列為重複；不會將只有外觀相似的照片列入。")
             }
             if !model.groups.isEmpty {
                 Button("建議勾選多餘副本") { model.suggest() }.disabled(model.busy)
             }
             ForEach(model.groups) { group in
-                Section("重複照片 · \(group.assets.count) 張") {
+                Section("重複\(model.kind) · \(group.assets.count) 個項目") {
                     ScrollView(.horizontal) {
                         HStack {
                             ForEach(group.assets, id: \.localIdentifier) { asset in
@@ -265,14 +270,14 @@ struct PhotoScreen: View {
                 }
             }
         }
-        .navigationTitle("照片清理")
+        .navigationTitle("\(model.kind)清理")
         .safeAreaInset(edge: .bottom) {
-            Button("清理已選 \(model.selected.count) 張") { confirm = true }
+            Button("清理已選 \(model.selected.count) 個項目") { confirm = true }
                 .buttonStyle(.borderedProminent).tint(.teal)
                 .disabled(model.selected.isEmpty || model.busy).padding()
                 .frame(maxWidth: .infinity).background(.regularMaterial)
         }
-        .confirmationDialog("刪除已選的 \(model.selected.count) 張照片？", isPresented: $confirm, titleVisibility: .visible) {
+        .confirmationDialog("刪除已選的 \(model.selected.count) 個\(model.kind)？", isPresented: $confirm, titleVisibility: .visible) {
             Button("確認刪除", role: .destructive) { Task { await model.deleteSelected() } }
         } message: {
             Text("每組至少保留一張。若啟用 iCloud 照片，刪除會同步至其他裝置。系統可能再次要求確認。")
@@ -294,44 +299,32 @@ struct DocumentScanResult: Sendable {
     let inaccessibleRoots: Int
     let paused: Bool
 }
-private struct DocumentScanCheckpoint: Codable {
+struct DocumentScanCheckpoint: Codable {
     let roots: [String]
     let files: [ScannedDocument]
     let pending: Bool
 }
 struct DocumentScreen: View {
+    @ObservedObject var model: DocumentModel
     @State private var picker = false
     @State private var pickFolders = true
-    @State private var busy = false
-    @State private var roots: [URL] = []
-    @State private var files: [ScannedDocument] = []
     @State private var duplicatesOnly = false
-    @State private var restored = false
-    @State private var cancellation: ScanCancellation?
-    @State private var canResume = false
-    @State private var message = "加入「我的 iPhone」或 iCloud Drive 中可選取的資料夾，會連同所有子資料夾一起掃描。"
-    private var groups: [[ScannedDocument]] {
-        Dictionary(grouping: files, by: \.digest).values.filter { $0.count > 1 }
-            .sorted { ($0.first?.path ?? "") < ($1.first?.path ?? "") }
-    }
     var body: some View {
         List {
             Section {
-                Button("加入資料夾與子資料夾") { pickFolders = true; picker = true }.disabled(busy)
-                Button("加入個別文件") { pickFolders = false; picker = true }.disabled(busy)
-                ForEach(roots, id: \.absoluteString) { root in
+                Button("加入資料夾與子資料夾") { pickFolders = true; picker = true }.disabled(model.busy)
+                Button("加入個別文件") { pickFolders = false; picker = true }.disabled(model.busy)
+                ForEach(model.roots, id: \.absoluteString) { root in
                     Label(root.lastPathComponent, systemImage: "folder")
                 }
-                if !roots.isEmpty {
-                    Button("掃描全部已選位置") { scan() }.disabled(busy)
-                    if canResume {
-                        Button("繼續上次文件掃描") { scan(resume: true) }.disabled(busy)
+                if !model.roots.isEmpty {
+                    Button("掃描全部已選位置") { model.scan() }.disabled(model.busy)
+                    if model.canResume {
+                        Button("繼續上次文件掃描") { model.scan(resume: true) }.disabled(model.busy)
                     }
                     Button("清除掃描位置與結果", role: .destructive) {
-                        roots = []; files = []; canResume = false
-                        ScanCheckpoint.clear("documents"); ScanCheckpoint.clear("document-roots")
-                        message = "請重新加入掃描位置。"
-                    }.disabled(busy)
+                        model.clear()
+                    }.disabled(model.busy)
                 }
             } header: {
                 Text("掃描位置")
@@ -339,57 +332,34 @@ struct DocumentScreen: View {
                 Text("可分次加入多個位置。iOS 僅允許讀取你選取的資料夾與文件，無法掃描其他 App 的私人檔案或整部手機的系統目錄。")
             }
             Section {
-                if busy {
+                if model.busy {
                     ProgressView("正在讀取與比對所有已選位置…")
-                    Button("停止文件掃描") { cancellation?.cancel() }
+                    Button("停止文件掃描") { model.cancellation?.cancel() }
                 }
-                Text(message).font(.subheadline)
+                Text(model.message).font(.subheadline)
                 Toggle("只顯示完全重複的文件", isOn: $duplicatesOnly)
             } footer: {
                 Text("只讀取已下載的檔案；雲端未下載、無權限或讀取失敗項目會略過。文件內容在手機內比對；文件刪除尚未啟用。切換 App 後可短暫繼續，系統暫停後可接續。")
             }
             if duplicatesOnly {
-                ForEach(Array(groups.enumerated()), id: \.offset) { index, group in
+                ForEach(Array(model.groups.enumerated()), id: \.offset) { index, group in
                     Section("重複文件第 \(index + 1) 組 · \(group.count) 份") {
                         ForEach(group) { documentRow($0) }
                     }
                 }
             } else {
-                Section("所有可讀文件 · \(files.count) 份") {
-                    ForEach(files) { documentRow($0) }
+                Section("所有可讀文件 · \(model.files.count) 份") {
+                    ForEach(model.files) { documentRow($0) }
                 }
             }
         }
         .navigationTitle("文件全面掃描")
-        .onAppear {
-            guard !restored else { return }; restored = true
-            if let bookmarks = ScanCheckpoint.load("document-roots", as: [Data].self) {
-                roots = bookmarks.compactMap { data in
-                    var stale = false
-                    return try? URL(resolvingBookmarkData: data, options: [.withoutUI], relativeTo: nil, bookmarkDataIsStale: &stale)
-                }
-            }
-            if let saved = ScanCheckpoint.load("documents", as: DocumentScanCheckpoint.self),
-               saved.roots == roots.map(\.absoluteString) {
-                files = saved.files; canResume = saved.pending
-                message = "已恢復 \(files.count) 份文件的掃描進度。\(canResume ? "可按繼續上次文件掃描。" : "上次掃描已完成。")"
-            }
-        }
         .fileImporter(isPresented: $picker,
                       allowedContentTypes: pickFolders ? [.folder] : [.data],
                       allowsMultipleSelection: true) { result in
             switch result {
-            case .failure(let error): message = "未加入位置：\(error.localizedDescription)"
-            case .success(let urls):
-                for url in urls where !roots.contains(url) { roots.append(url) }
-                files = []; canResume = false; ScanCheckpoint.clear("documents")
-                let bookmarks = roots.compactMap { url -> Data? in
-                    guard url.startAccessingSecurityScopedResource() else { return nil }
-                    defer { url.stopAccessingSecurityScopedResource() }
-                    return try? url.bookmarkData(options: [.minimalBookmark], includingResourceValuesForKeys: nil, relativeTo: nil)
-                }
-                ScanCheckpoint.save(bookmarks, name: "document-roots")
-                message = "已加入 \(roots.count) 個位置。請按「掃描全部已選位置」。"
+            case .failure(let error): model.message = "未加入位置：\(error.localizedDescription)"
+            case .success(let urls): model.add(urls)
             }
         }
     }
@@ -399,24 +369,6 @@ struct DocumentScreen: View {
             Text(file.path).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
             Text(ByteCountFormatter.string(fromByteCount: file.bytes, countStyle: .file))
                 .font(.caption).foregroundStyle(.secondary)
-        }
-    }
-    private func scan(resume: Bool = false) {
-        guard !busy else { return }
-        let lease = BackgroundScanLease(name: "Document scan")
-        cancellation = lease.cancellation
-        busy = true; files = []; message = "正在掃描全部已選位置…"
-        let selectedRoots = roots
-        Task {
-            defer { lease.end(); cancellation = nil }
-            let token = lease.cancellation
-            let result = await Task.detached(priority: .utility) {
-                scanDocuments(selectedRoots, resume: resume, cancellation: token)
-            }.value
-            files = result.files
-            canResume = result.paused
-            message = "\(canResume ? "已暫停，可繼續。" : "掃描完成。")已掃描 \(files.count) 份文件，找到 \(groups.count) 組完全重複文件。略過 \(result.skipped) 項，\(result.inaccessibleRoots) 個位置無法存取。"
-            busy = false
         }
     }
 }
@@ -495,7 +447,7 @@ func scanDocuments(_ roots: [URL], resume: Bool = false,
 }
 
 struct MailScreen: View {
-    var body: some View { GmailCleanupScreen() }
+    var body: some View { GmailCleanupScreen(model: ScanCenter.shared.mail) }
 }
 
 struct Dashboard: View {
@@ -509,16 +461,26 @@ struct Dashboard: View {
                         Text("先看清楚，再安心清理。").foregroundStyle(.secondary)
                     }.padding(.vertical, 20)
                 }
+                Section {
+                    NavigationLink { ScanControlScreen() } label: {
+                        Label("四項同時掃描與進度", systemImage: "square.stack.3d.up")
+                    }
+                }
                 Section("清理工具") {
-                    NavigationLink { PhotoScreen() } label: { Label("照片 · 全部已授權照片掃描", systemImage: "photo.on.rectangle.angled") }
-                    NavigationLink { DocumentScreen() } label: { Label("文件 · 全部已選位置掃描", systemImage: "doc.on.doc") }
+                    NavigationLink { PhotoScreen(model: ScanCenter.shared.videos) } label: {
+                        Label("影片 · 重複影片掃描", systemImage: "video")
+                    }
+                    NavigationLink { PhotoScreen(model: ScanCenter.shared.photos) } label: { Label("照片 · 全部已授權照片掃描", systemImage: "photo.on.rectangle.angled") }
+                    NavigationLink { DocumentScreen(model: ScanCenter.shared.documents) } label: { Label("文件 · 全部已選位置掃描", systemImage: "doc.on.doc") }
                     NavigationLink { MailScreen() } label: { Label("郵件 · 全部郵件整理", systemImage: "envelope") }
                 }
                 Section {
+                    Text("版本 \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")（\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "")）").font(.caption).foregroundStyle(.secondary)
                     Text("開發測試版 · 尚未完成真機驗證").font(.caption).foregroundStyle(.secondary)
                     Text("不會自動清理，也不會把照片和文件內容上傳到伺服器。").font(.footnote)
                 }
             }.navigationTitle("清爽口袋").tint(.teal)
+                .task { await ScanCenter.shared.mail.restore() }
         }
     }
 }
